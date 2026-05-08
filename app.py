@@ -90,6 +90,19 @@ def detect_iface():
     global IFACE
     if IFACE:
         return IFACE
+    # На Linux самый надёжный способ — интерфейс default route.
+    try:
+        r = subprocess.run(
+            ["ip", "-4", "route", "show", "default"],
+            capture_output=True, text=True, timeout=3
+        )
+        # Пример строки: "default via 192.168.1.1 dev ens18 proto dhcp ..."
+        m = re.search(r"\bdev\s+(\S+)", r.stdout or "")
+        if m:
+            IFACE = m.group(1)
+            return IFACE
+    except Exception:
+        pass
     if HAS_PSUTIL:
         stats = psutil.net_if_stats()
         addrs = psutil.net_if_addrs()
@@ -130,12 +143,19 @@ def arp_scan(network: str, iface: str):
     """Запускает arp-scan или nmap для нахождения устройств."""
     found = {}
 
-    # Способ 1: arp-scan (быстрее)
+    # Способ 1: arp-scan по целевой сети и интерфейсу (быстрее и точнее)
     try:
         r = subprocess.run(
-            ["arp-scan", "--localnet", f"--interface={iface}"],
+            ["arp-scan", network, f"--interface={iface}"],
             capture_output=True, text=True, timeout=20
         )
+        if (not r.stdout.strip()) and (r.returncode != 0):
+            # Fallback для окружений, где network-формат отклоняется,
+            # но --localnet работает стабильно.
+            r = subprocess.run(
+                ["arp-scan", "--localnet", f"--interface={iface}"],
+                capture_output=True, text=True, timeout=20
+            )
         for line in r.stdout.splitlines():
             m = re.match(r"(\d+\.\d+\.\d+\.\d+)\s+([\w:]+)\s*(.*)", line)
             if m:
@@ -149,7 +169,9 @@ def arp_scan(network: str, iface: str):
     if not found:
         try:
             r = subprocess.run(
-                ["nmap", "-sn", "-PR", "--open", network],
+                # Не используем --open: иначе "живые" хосты без открытых портов
+                # могут отфильтровываться и выглядеть как "не найденные".
+                ["nmap", "-sn", "-PR", "-n", "-e", iface, network],
                 capture_output=True, text=True, timeout=60
             )
             ip, mac, hostname = None, "", ""
@@ -170,12 +192,17 @@ def arp_scan(network: str, iface: str):
 
     # Способ 3: ARP из таблицы ядра (всегда доступен)
     try:
+        net_obj = ipaddress.ip_network(network, strict=False)
         with open("/proc/net/arp") as f:
             for line in f.readlines()[1:]:
                 parts = line.split()
                 if len(parts) >= 4:
                     ip, mac = parts[0], parts[3]
-                    if mac != "00:00:00:00:00:00" and ip not in found:
+                    if (
+                        mac != "00:00:00:00:00:00"
+                        and ip not in found
+                        and ipaddress.ip_address(ip) in net_obj
+                    ):
                         found[ip] = {"ip": ip, "mac": mac.upper(), "vendor": "",
                                      "hostname": "", "method": "arp-table"}
     except Exception:
@@ -203,6 +230,11 @@ def discovery_loop():
 
     while True:
         found = arp_scan(network, iface)
+        if not found:
+            add_event(
+                f"Сканирование не вернуло хосты (iface={iface}, network={network})",
+                "warn"
+            )
 
         with lock:
             for ip, info in found.items():
