@@ -187,11 +187,15 @@ body::after {
 
 /* ── Events ── */
 .events-area { padding: 0 16px 16px; }
-.events-head { font-size: 10px; text-transform: uppercase; letter-spacing: 1.5px; color: var(--c2); padding: 8px 0 6px; border-bottom: 1px solid var(--border); margin-bottom: 4px; }
+.events-head { font-size: 10px; text-transform: uppercase; letter-spacing: 1.5px; color: var(--c2); padding: 8px 0 6px; border-bottom: 1px solid var(--border); margin-bottom: 4px; display:flex; align-items:center; justify-content:space-between; gap:8px; }
 .event-row { display: flex; gap: 10px; padding: 6px 0; border-bottom: 1px solid rgba(30,47,74,.4); align-items: flex-start; }
 .ev-bullet { font-size: 11px; flex-shrink: 0; margin-top: 1px; }
 .ev-msg  { font-size: 11px; color: var(--c1); flex: 1; }
 .ev-time { font-size: 10px; color: var(--c2); flex-shrink: 0; }
+.events-list { max-height: 260px; overflow-y: auto; }
+.events-actions { display:flex; gap:8px; }
+.mini-btn { font-family: var(--font-mono); font-size: 10px; padding: 2px 8px; border: 1px solid var(--border); background: transparent; color: var(--c1); cursor: pointer; border-radius: 2px; }
+.mini-btn:hover { border-color: var(--blue); color: var(--blue); }
 
 /* ── Welcome screen ── */
 .welcome { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; color: var(--c2); text-align: center; padding: 40px; }
@@ -210,6 +214,7 @@ body::after {
 
 /* ── Ping result ── */
 #ping-result { font-size: 11px; padding: 6px 10px; background: var(--bg3); border: 1px solid var(--border); border-radius: 2px; color: var(--teal); display: none; margin-left: auto; }
+#capture-status { font-size: 11px; padding: 6px 10px; background: var(--bg3); border: 1px solid var(--border); border-radius: 2px; color: var(--blue); display: none; margin-left: auto; }
 </style>
 </head>
 <body>
@@ -225,7 +230,7 @@ body::after {
     <span id="conn-count">—</span>
     <span id="clock">--:--:--</span>
     <button class="tb-btn" onclick="togglePause()" id="btn-pause">⏸ PAUSE</button>
-    <button class="tb-btn" onclick="location.href='/api/events'">LOG</button>
+    <button class="tb-btn" onclick="downloadTodayLogs()">LOG</button>
   </div>
 </nav>
 
@@ -267,6 +272,8 @@ body::after {
         <span class="section-meta" id="dv-mac">—</span>
         <span class="section-badge" id="dv-status">—</span>
         <span id="ping-result"></span>
+        <span id="capture-status"></span>
+        <button class="section-ping-btn" onclick="startCapture(30)">🧪 Tcpdump 30s</button>
         <button class="section-ping-btn" onclick="manualPing()">⚡ Ping</button>
       </div>
 
@@ -328,8 +335,14 @@ body::after {
 
       <!-- Events -->
       <div class="events-area">
-        <div class="events-head">Журнал событий</div>
-        <div id="events-list"></div>
+        <div class="events-head">
+          <span>Журнал событий</span>
+          <div class="events-actions">
+            <button class="mini-btn" onclick="loadMoreEvents()">Еще</button>
+            <button class="mini-btn" onclick="downloadTodayLogs()">Скачать</button>
+          </div>
+        </div>
+        <div id="events-list" class="events-list"></div>
       </div>
     </div>
   </section>
@@ -345,6 +358,9 @@ let selectedIP   = null;
 let allDevices   = [];
 let filterText   = '';
 const prevVals   = {};
+let eventsOffset = 0;
+const eventsLimit = 50;
+let allEventsLoaded = false;
 
 const N    = 60;
 const LBLS = Array.from({length:N}, (_,i) => i===N-1?'0':String(-(N-1-i)));
@@ -464,7 +480,7 @@ function renderDeviceList() {
   }).join('');
 
   document.getElementById('conn-count').textContent =
-    `${filtered.filter(d=>d.online).length}/${filtered.length} online`;
+    `${allDevices.filter(d=>d.online).length}/${allDevices.length} online`;
 }
 
 function filterDevices(val) {
@@ -581,20 +597,47 @@ async function refreshDeviceView() {
 // ══════════════════════════════════════════════════════
 // EVENTS
 // ══════════════════════════════════════════════════════
-async function refreshEvents() {
+function renderEvents(items, append=false) {
+  const el = document.getElementById('events-list');
+  const colMap = {info:'◦', warn:'◈', error:'◉'};
+  const colClr = {info:'var(--c2)', warn:'var(--orange)', error:'var(--red)'};
+  const html = items.map(e =>
+    `<div class="event-row">
+      <span class="ev-bullet" style="color:${colClr[e.level]||'var(--c2)'}">${colMap[e.level]||'◦'}</span>
+      <span class="ev-msg">${e.msg}</span>
+      <span class="ev-time">${e.time}</span>
+    </div>`
+  ).join('');
+  if(!append) el.innerHTML = html;
+  else el.innerHTML += html;
+  if(!el.innerHTML.trim()) {
+    el.innerHTML = '<div style="color:var(--c2);font-size:11px;padding:8px 0">Нет событий</div>';
+  }
+}
+
+async function refreshEvents(reset=true) {
   try {
-    const r = await fetch('/api/events');
-    const evs = await r.json();
-    const colMap = {info:'◦', warn:'◈', error:'◉'};
-    const colClr = {info:'var(--c2)', warn:'var(--orange)', error:'var(--red)'};
-    document.getElementById('events-list').innerHTML = evs.slice(0,8).map(e =>
-      `<div class="event-row">
-        <span class="ev-bullet" style="color:${colClr[e.level]||'var(--c2)'}">${colMap[e.level]||'◦'}</span>
-        <span class="ev-msg">${e.msg}</span>
-        <span class="ev-time">${e.time}</span>
-      </div>`
-    ).join('') || '<div style="color:var(--c2);font-size:11px;padding:8px 0">Нет событий</div>';
+    if(reset) {
+      eventsOffset = 0;
+      allEventsLoaded = false;
+    }
+    const r = await fetch(`/api/events?offset=${eventsOffset}&limit=${eventsLimit}`);
+    if(!r.ok) return;
+    const payload = await r.json();
+    const items = payload.items || [];
+    renderEvents(items, !reset);
+    eventsOffset += items.length;
+    allEventsLoaded = eventsOffset >= (payload.total || 0);
   } catch(e) {}
+}
+
+function loadMoreEvents() {
+  if(allEventsLoaded) return;
+  refreshEvents(false);
+}
+
+function downloadTodayLogs() {
+  window.open('/api/events/download', '_blank');
 }
 
 // ══════════════════════════════════════════════════════
@@ -643,6 +686,44 @@ function triggerScan() {
   });
 }
 
+async function startCapture(seconds=30) {
+  if(!selectedIP) return;
+  const el = document.getElementById('capture-status');
+  el.style.display = 'block';
+  el.style.color = 'var(--orange)';
+  el.textContent = `tcpdump ${seconds}s...`;
+
+  try {
+    const r = await fetch(`/api/capture/start/${selectedIP}?seconds=${seconds}`, { method:'POST' });
+    const d = await r.json();
+    if(!r.ok) {
+      el.style.color = 'var(--red)';
+      el.textContent = d.error || 'Ошибка запуска tcpdump';
+      return;
+    }
+
+    const poll = async () => {
+      const s = await fetch(`/api/capture/status/${d.job_id}`);
+      const j = await s.json();
+      if(j.status === 'running') {
+        setTimeout(poll, 2000);
+        return;
+      }
+      if(j.status === 'done' && j.download_url) {
+        el.style.color = 'var(--green)';
+        el.innerHTML = `Готово: <a href="${j.download_url}" target="_blank" style="color:var(--teal)">скачать pcap</a>`;
+      } else {
+        el.style.color = 'var(--red)';
+        el.textContent = `tcpdump: ${j.error || 'ошибка'}`;
+      }
+    };
+    poll();
+  } catch(e) {
+    el.style.color = 'var(--red)';
+    el.textContent = 'Ошибка tcpdump';
+  }
+}
+
 // ══════════════════════════════════════════════════════
 // PAUSE
 // ══════════════════════════════════════════════════════
@@ -664,10 +745,10 @@ setInterval(()=>{
 // POLLING LOOPS
 // ══════════════════════════════════════════════════════
 refreshDevices();
-refreshEvents();
+refreshEvents(true);
 
 setInterval(refreshDevices, 3000);
-setInterval(refreshEvents,  3000);
+setInterval(()=>refreshEvents(true), 3000);
 setInterval(()=>{ if(selectedIP) refreshDeviceView(); }, 1000);
 </script>
 </body>

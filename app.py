@@ -5,10 +5,11 @@ NetAnalyzer v2 — Пассивный захват трафика + обнару
 Запуск:     sudo python3 app.py   (нужен root для scapy/promiscuous mode)
 """
 
-import subprocess, threading, time, json, re, os, socket, statistics, ipaddress
+import subprocess, threading, time, json, re, os, socket, statistics, ipaddress, uuid
+from pathlib import Path
 from datetime import datetime
 from collections import deque, defaultdict
-from flask import Flask, jsonify, render_template, Response
+from flask import Flask, jsonify, render_template, Response, request, send_file
 from flask_cors import CORS
 
 # ── Зависимости ───────────────────────────────────────────────────────────────
@@ -37,6 +38,13 @@ IFACE        = os.environ.get("IFACE", "")          # "" = авто (первы�
 PING_HOST    = os.environ.get("PING_HOST", "8.8.8.8")
 HISTORY_SIZE = 300   # 5 минут при 1 сек/тик
 SCAN_INTERVAL = 30   # секунд между ARP-сканами
+EVENTS_IN_MEMORY = int(os.environ.get("EVENTS_IN_MEMORY", "2000"))
+LOG_DIR = Path(os.environ.get("LOG_DIR", "./logs")).resolve()
+CAPTURE_DIR = Path(os.environ.get("CAPTURE_DIR", "./captures")).resolve()
+CAPTURE_MAX_SECONDS = int(os.environ.get("CAPTURE_MAX_SECONDS", "300"))
+
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
 
 # ── Глобальное состояние ──────────────────────────────────────────────────────
 # Используем reentrant lock: add_event() может вызываться внутри участков,
@@ -73,7 +81,8 @@ host_metrics: dict[str, dict] = defaultdict(lambda: {
 })
 
 # Журнал событий
-events = deque(maxlen=100)
+events = deque(maxlen=EVENTS_IN_MEMORY)
+capture_jobs: dict[str, dict] = {}
 
 # Подсчёт скорости
 _speed_ts = time.time()
@@ -81,9 +90,24 @@ _speed_ts = time.time()
 def ts():
     return datetime.now().strftime("%H:%M:%S")
 
+def _event_log_file(date_str: str | None = None) -> Path:
+    if not date_str:
+        date_str = datetime.now().strftime("%Y-%m-%d")
+    return LOG_DIR / f"{date_str}.log"
+
+def _write_event_to_disk(rec: dict):
+    try:
+        line = json.dumps(rec, ensure_ascii=False)
+        with _event_log_file().open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
 def add_event(msg, level="info"):
+    rec = {"time": ts(), "msg": msg, "level": level}
     with lock:
-        events.appendleft({"time": ts(), "msg": msg, "level": level})
+        events.appendleft(rec)
+    _write_event_to_disk(rec)
 
 
 # ── Определение интерфейса ────────────────────────────────────────────────────
@@ -192,31 +216,53 @@ def arp_scan(network: str, iface: str):
         except (FileNotFoundError, subprocess.TimeoutExpired):
             pass
 
-    # Способ 3: ARP из таблицы ядра (всегда доступен)
-    try:
-        net_obj = ipaddress.ip_network(network, strict=False)
-        with open("/proc/net/arp") as f:
-            for line in f.readlines()[1:]:
-                parts = line.split()
-                if len(parts) >= 4:
-                    ip, mac = parts[0], parts[3]
-                    if (
-                        mac != "00:00:00:00:00:00"
-                        and ip not in found
-                        and ipaddress.ip_address(ip) in net_obj
-                    ):
-                        found[ip] = {"ip": ip, "mac": mac.upper(), "vendor": "",
-                                     "hostname": "", "method": "arp-table"}
-    except Exception:
-        pass
+    # Способ 3: ARP-таблица как fallback, если активный скан ничего не дал.
+    if not found:
+        try:
+            net_obj = ipaddress.ip_network(network, strict=False)
+            with open("/proc/net/arp") as f:
+                for line in f.readlines()[1:]:
+                    parts = line.split()
+                    if len(parts) >= 6:
+                        ip, flags, mac, dev = parts[0], parts[2], parts[3], parts[5]
+                        if (
+                            mac != "00:00:00:00:00:00"
+                            and flags == "0x2"
+                            and dev == iface
+                            and ip not in found
+                            and ipaddress.ip_address(ip) in net_obj
+                        ):
+                            found[ip] = {"ip": ip, "mac": mac.upper(), "vendor": "",
+                                        "hostname": "", "method": "arp-table"}
+        except Exception:
+            pass
 
-    # Разрешение имён (быстрый DNS)
+    def resolve_hostname(ip: str, current: str = "") -> str:
+        if current and current != ip and current.lower() != "unknown":
+            return current
+        try:
+            host = socket.gethostbyaddr(ip)[0]
+            if host and host != ip:
+                return host
+        except Exception:
+            pass
+        # Часто телефоны отвечают в mDNS; пробуем avahi, если установлен.
+        try:
+            r = subprocess.run(
+                ["avahi-resolve-address", ip],
+                capture_output=True, text=True, timeout=2
+            )
+            if r.returncode == 0 and "\t" in r.stdout:
+                host = r.stdout.split("\t", 1)[1].strip()
+                if host and host != ip:
+                    return host
+        except Exception:
+            pass
+        return current or ip
+
+    # Разрешение имён
     for ip, info in found.items():
-        if not info.get("hostname"):
-            try:
-                info["hostname"] = socket.gethostbyaddr(ip)[0]
-            except Exception:
-                info["hostname"] = ip
+        info["hostname"] = resolve_hostname(ip, info.get("hostname", ""))
 
     return found
 
@@ -231,6 +277,7 @@ def discovery_loop():
     add_event(f"Сканирую сеть {network}...", "info")
 
     while True:
+        now = time.time()
         found = arp_scan(network, iface)
         if not found:
             add_event(
@@ -247,14 +294,17 @@ def discovery_loop():
                     "is_self": ip == my_ip,
                     "online": True,
                     "last_seen": ts(),
+                    "last_seen_ts": now,
                     "rx_mbps":  traffic[ip]["rx_mbps"],
                     "tx_mbps":  traffic[ip]["tx_mbps"],
                     "pps":      traffic[ip]["pps"],
                 }
-            # Помечаем пропавшие
+
+            # Считаем offline по TTL, чтобы не держать "вечный online".
+            online_ttl = SCAN_INTERVAL * 2.5
             for ip in list(devices.keys()):
-                if ip not in found:
-                    devices[ip]["online"] = False
+                age = now - float(devices[ip].get("last_seen_ts", 0))
+                devices[ip]["online"] = age <= online_ttl
 
         time.sleep(SCAN_INTERVAL)
 
@@ -562,8 +612,33 @@ def api_stream():
 
 @app.route("/api/events")
 def api_events():
+    limit = max(1, min(500, int(request.args.get("limit", "50"))))
+    offset = max(0, int(request.args.get("offset", "0")))
     with lock:
-        return jsonify(list(events)[:30])
+        ev = list(events)
+    return jsonify({
+        "items": ev[offset:offset + limit],
+        "total": len(ev),
+        "offset": offset,
+        "limit": limit
+    })
+
+
+@app.route("/api/events/files")
+def api_events_files():
+    files = sorted([p.name for p in LOG_DIR.glob("*.log")], reverse=True)
+    return jsonify({"files": files})
+
+
+@app.route("/api/events/download")
+def api_events_download():
+    date_str = request.args.get("date", datetime.now().strftime("%Y-%m-%d"))
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", date_str):
+        return jsonify({"error": "invalid date format, expected YYYY-MM-DD"}), 400
+    p = _event_log_file(date_str)
+    if not p.exists():
+        return jsonify({"error": f"log not found for {date_str}"}), 404
+    return send_file(p, as_attachment=True, download_name=f"netanalyzer-events-{date_str}.log")
 
 
 @app.route("/api/ping/<ip>")
@@ -581,7 +656,106 @@ def api_info():
         "network": get_network_prefix(iface),
         "has_scapy": HAS_SCAPY, "has_psutil": HAS_PSUTIL,
         "devices_count": len(devices),
+        "log_dir": str(LOG_DIR),
+        "capture_dir": str(CAPTURE_DIR),
     })
+
+
+def _capture_worker(job_id: str, ip: str, iface: str, seconds: int, out_file: Path):
+    target = [] if ip == "all" else ["host", ip]
+    cmd = [
+        "tcpdump", "-i", iface, *target,
+        "-w", str(out_file), "-G", str(seconds), "-W", "1"
+    ]
+    try:
+        add_event(f"TCPDUMP старт: {ip}, {seconds}s", "info")
+        r = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=seconds + 20
+        )
+        with lock:
+            job = capture_jobs.get(job_id, {})
+            job["finished_at"] = time.time()
+            if r.returncode == 0 and out_file.exists() and out_file.stat().st_size > 24:
+                job["status"] = "done"
+                job["size"] = out_file.stat().st_size
+                add_event(f"TCPDUMP готов: {out_file.name}", "info")
+            else:
+                job["status"] = "error"
+                job["error"] = (r.stderr or r.stdout or "tcpdump failed").strip()[:300]
+                add_event(f"TCPDUMP ошибка: {job['error']}", "error")
+            capture_jobs[job_id] = job
+    except Exception as e:
+        with lock:
+            job = capture_jobs.get(job_id, {})
+            job["status"] = "error"
+            job["error"] = str(e)
+            job["finished_at"] = time.time()
+            capture_jobs[job_id] = job
+        add_event(f"TCPDUMP exception: {e}", "error")
+
+
+@app.route("/api/capture/start/<ip>", methods=["POST"])
+def api_capture_start(ip: str):
+    iface = detect_iface()
+    if ip != "all":
+        try:
+            ipaddress.ip_address(ip)
+        except ValueError:
+            return jsonify({"error": "invalid ip"}), 400
+
+    seconds = max(5, min(CAPTURE_MAX_SECONDS, int(request.args.get("seconds", "30"))))
+    job_id = uuid.uuid4().hex[:12]
+    ts_name = datetime.now().strftime("%Y%m%d-%H%M%S")
+    safe_ip = ip.replace(":", "_")
+    out_file = CAPTURE_DIR / f"capture-{safe_ip}-{ts_name}.pcap"
+    target = [] if ip == "all" else ["host", ip]
+
+    cmd = [
+        "tcpdump", "-i", iface, *target,
+        "-w", str(out_file), "-G", str(seconds), "-W", "1"
+    ]
+    with lock:
+        capture_jobs[job_id] = {
+            "id": job_id,
+            "status": "running",
+            "ip": ip,
+            "iface": iface,
+            "seconds": seconds,
+            "file": str(out_file),
+            "started_at": time.time(),
+            "cmd": " ".join(cmd),
+        }
+
+    threading.Thread(
+        target=_capture_worker, args=(job_id, ip, iface, seconds, out_file), daemon=True
+    ).start()
+    return jsonify({"job_id": job_id, "status": "running", "seconds": seconds})
+
+
+@app.route("/api/capture/status/<job_id>")
+def api_capture_status(job_id: str):
+    with lock:
+        job = capture_jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "job not found"}), 404
+    resp = dict(job)
+    if job.get("status") == "done":
+        resp["download_url"] = f"/api/capture/download/{job_id}"
+    return jsonify(resp)
+
+
+@app.route("/api/capture/download/<job_id>")
+def api_capture_download(job_id: str):
+    with lock:
+        job = capture_jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "job not found"}), 404
+    if job.get("status") != "done":
+        return jsonify({"error": "capture not ready"}), 409
+    p = Path(job["file"])
+    if not p.exists():
+        return jsonify({"error": "pcap file not found"}), 404
+    return send_file(p, as_attachment=True, download_name=p.name)
 
 
 # ── Запуск ────────────────────────────────────────────────────────────────────
