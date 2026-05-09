@@ -42,6 +42,8 @@ EVENTS_IN_MEMORY = int(os.environ.get("EVENTS_IN_MEMORY", "2000"))
 LOG_DIR = Path(os.environ.get("LOG_DIR", "./logs")).resolve()
 CAPTURE_DIR = Path(os.environ.get("CAPTURE_DIR", "./captures")).resolve()
 CAPTURE_MAX_SECONDS = int(os.environ.get("CAPTURE_MAX_SECONDS", "300"))
+DEVICE_NAMES_FILE = Path(os.environ.get("DEVICE_NAMES_FILE", "./device-names.json")).resolve()
+IPERF_MAX_SECONDS = int(os.environ.get("IPERF_MAX_SECONDS", "60"))
 
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
@@ -83,6 +85,8 @@ host_metrics: dict[str, dict] = defaultdict(lambda: {
 # Журнал событий
 events = deque(maxlen=EVENTS_IN_MEMORY)
 capture_jobs: dict[str, dict] = {}
+iperf_jobs: dict[str, dict] = {}
+device_names: dict[str, str] = {}
 
 # Подсчёт скорости
 _speed_ts = time.time()
@@ -108,6 +112,45 @@ def add_event(msg, level="info"):
     with lock:
         events.appendleft(rec)
     _write_event_to_disk(rec)
+
+
+def _device_name_key(ip: str = "", mac: str = "") -> str:
+    if mac:
+        return f"mac:{mac.strip().upper()}"
+    return f"ip:{ip.strip()}"
+
+
+def load_device_names():
+    global device_names
+    try:
+        if DEVICE_NAMES_FILE.exists():
+            data = json.loads(DEVICE_NAMES_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                device_names = {str(k): str(v) for k, v in data.items()}
+    except Exception:
+        device_names = {}
+
+
+def save_device_names():
+    try:
+        DEVICE_NAMES_FILE.write_text(
+            json.dumps(device_names, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+def get_custom_name(ip: str = "", mac: str = "") -> str:
+    if mac:
+        by_mac = device_names.get(_device_name_key(mac=mac))
+        if by_mac:
+            return by_mac
+    if ip:
+        by_ip = device_names.get(_device_name_key(ip=ip))
+        if by_ip:
+            return by_ip
+    return ""
 
 
 # ── Определение интерфейса ────────────────────────────────────────────────────
@@ -292,6 +335,7 @@ def discovery_loop():
                 devices[ip] = {
                     **info,
                     "is_self": ip == my_ip,
+                    "custom_name": get_custom_name(ip, info.get("mac", "")),
                     "online": True,
                     "last_seen": ts(),
                     "last_seen_ts": now,
@@ -658,6 +702,7 @@ def api_info():
         "devices_count": len(devices),
         "log_dir": str(LOG_DIR),
         "capture_dir": str(CAPTURE_DIR),
+        "device_names_file": str(DEVICE_NAMES_FILE),
     })
 
 
@@ -758,9 +803,119 @@ def api_capture_download(job_id: str):
     return send_file(p, as_attachment=True, download_name=p.name)
 
 
+def _iperf_worker(job_id: str, ip: str, seconds: int, reverse: bool):
+    cmd = ["iperf3", "-c", ip, "-J", "-t", str(seconds), "-P", "1"]
+    if reverse:
+        cmd.append("-R")
+    try:
+        add_event(f"IPERF старт: {ip}, {seconds}s{' (reverse)' if reverse else ''}", "info")
+        r = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=seconds + 25
+        )
+        with lock:
+            job = iperf_jobs.get(job_id, {})
+            job["finished_at"] = time.time()
+            if r.returncode != 0:
+                job["status"] = "error"
+                job["error"] = (r.stderr or r.stdout or "iperf3 failed").strip()[:500]
+                iperf_jobs[job_id] = job
+                add_event(f"IPERF ошибка: {job['error']}", "error")
+                return
+
+            payload = json.loads(r.stdout or "{}")
+            end = payload.get("end", {})
+            sender = end.get("sum_sent", {}) or {}
+            receiver = end.get("sum_received", {}) or {}
+            result = {
+                "sender_mbps": round(float(sender.get("bits_per_second", 0.0)) / 1e6, 3),
+                "receiver_mbps": round(float(receiver.get("bits_per_second", 0.0)) / 1e6, 3),
+                "retransmits": int(sender.get("retransmits", 0) or 0),
+            }
+
+            job["status"] = "done"
+            job["result"] = result
+            iperf_jobs[job_id] = job
+            add_event(
+                f"IPERF готов: {ip} TX={result['sender_mbps']} Mbps RX={result['receiver_mbps']} Mbps",
+                "info",
+            )
+    except Exception as e:
+        with lock:
+            job = iperf_jobs.get(job_id, {})
+            job["status"] = "error"
+            job["error"] = str(e)
+            job["finished_at"] = time.time()
+            iperf_jobs[job_id] = job
+        add_event(f"IPERF exception: {e}", "error")
+
+
+@app.route("/api/iperf/start/<ip>", methods=["POST"])
+def api_iperf_start(ip: str):
+    try:
+        ipaddress.ip_address(ip)
+    except ValueError:
+        return jsonify({"error": "invalid ip"}), 400
+
+    seconds = max(3, min(IPERF_MAX_SECONDS, int(request.args.get("seconds", "10"))))
+    reverse = request.args.get("reverse", "0") in ("1", "true", "yes")
+    job_id = uuid.uuid4().hex[:12]
+
+    with lock:
+        iperf_jobs[job_id] = {
+            "id": job_id,
+            "status": "running",
+            "ip": ip,
+            "seconds": seconds,
+            "reverse": reverse,
+            "started_at": time.time(),
+        }
+
+    threading.Thread(
+        target=_iperf_worker, args=(job_id, ip, seconds, reverse), daemon=True
+    ).start()
+    return jsonify({"job_id": job_id, "status": "running", "seconds": seconds, "reverse": reverse})
+
+
+@app.route("/api/iperf/status/<job_id>")
+def api_iperf_status(job_id: str):
+    with lock:
+        job = iperf_jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "job not found"}), 404
+    return jsonify(job)
+
+
+@app.route("/api/device-name/<ip>", methods=["GET", "POST"])
+def api_device_name(ip: str):
+    with lock:
+        dev = devices.get(ip, {"ip": ip, "mac": ""})
+        mac = str(dev.get("mac", "") or "")
+
+    if request.method == "GET":
+        return jsonify({"ip": ip, "mac": mac, "custom_name": get_custom_name(ip, mac)})
+
+    data = request.get_json(silent=True) or {}
+    name = str(data.get("name", "")).strip()
+    if len(name) > 64:
+        return jsonify({"error": "name too long (max 64)"}), 400
+
+    key = _device_name_key(ip=ip, mac=mac)
+    with lock:
+        if name:
+            device_names[key] = name
+        else:
+            device_names.pop(key, None)
+        if ip in devices:
+            devices[ip]["custom_name"] = name
+    save_device_names()
+    add_event(f"Имя устройства {ip}: {'сброшено' if not name else name}", "info")
+    return jsonify({"ok": True, "ip": ip, "custom_name": name})
+
+
 # ── Запуск ────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    load_device_names()
     add_event("NetAnalyzer v2 запущен", "info")
 
     threads = [

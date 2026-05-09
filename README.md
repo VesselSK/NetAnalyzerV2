@@ -24,7 +24,7 @@ Python 3.10+
 ```bash
 sudo apt update
 sudo apt install -y python3 python3-pip python3-venv \
-    iputils-ping nmap arp-scan tcpdump avahi-utils libpcap-dev
+    iputils-ping nmap arp-scan tcpdump iperf3 avahi-utils libpcap-dev
 ```
 
 `arp-scan` и `nmap` используются для обнаружения устройств.  
@@ -91,6 +91,8 @@ IFACE=eth0          # интерфейс (авто если пусто)
 PING_HOST=8.8.8.8   # хост для baseline-пинга
 LOG_DIR=/opt/netanalyzer/logs        # где хранить логи событий по дням
 CAPTURE_DIR=/opt/netanalyzer/captures # где хранить pcap-файлы
+DEVICE_NAMES_FILE=/opt/netanalyzer/device-names.json # пользовательские имена
+IPERF_MAX_SECONDS=60   # максимум длительности iperf3-теста
 ```
 
 Пример:
@@ -118,6 +120,8 @@ RestartSec=2
 Environment=IFACE=eth0
 Environment=LOG_DIR=/opt/netanalyzer/logs
 Environment=CAPTURE_DIR=/opt/netanalyzer/captures
+Environment=DEVICE_NAMES_FILE=/opt/netanalyzer/device-names.json
+Environment=IPERF_MAX_SECONDS=60
 
 [Install]
 WantedBy=multi-user.target
@@ -169,6 +173,9 @@ server {
 | `POST /api/capture/start/<ip>?seconds=30` | Старт tcpdump по IP         |
 | `GET /api/capture/status/<job_id>` | Статус захвата                       |
 | `GET /api/capture/download/<job_id>` | Скачать pcap                   |
+| `POST /api/iperf/start/<ip>?seconds=10` | Старт iperf3-теста до устройства |
+| `GET /api/iperf/status/<job_id>` | Статус/результат iperf3              |
+| `GET/POST /api/device-name/<ip>` | Получить/сохранить пользовательское имя |
 
 ---
 

@@ -215,6 +215,7 @@ body::after {
 /* ── Ping result ── */
 #ping-result { font-size: 11px; padding: 6px 10px; background: var(--bg3); border: 1px solid var(--border); border-radius: 2px; color: var(--teal); display: none; margin-left: auto; }
 #capture-status { font-size: 11px; padding: 6px 10px; background: var(--bg3); border: 1px solid var(--border); border-radius: 2px; color: var(--blue); display: none; margin-left: auto; }
+#iperf-status { font-size: 11px; padding: 6px 10px; background: var(--bg3); border: 1px solid var(--border); border-radius: 2px; color: var(--green); display: none; margin-left: auto; }
 </style>
 </head>
 <body>
@@ -273,6 +274,9 @@ body::after {
         <span class="section-badge" id="dv-status">—</span>
         <span id="ping-result"></span>
         <span id="capture-status"></span>
+        <span id="iperf-status"></span>
+        <button class="section-ping-btn" onclick="setDeviceName()">✎ Имя</button>
+        <button class="section-ping-btn" onclick="startIperf(10)">⇆ iPerf 10s</button>
         <button class="section-ping-btn" onclick="startCapture(30)">🧪 Tcpdump 30s</button>
         <button class="section-ping-btn" onclick="manualPing()">⚡ Ping</button>
       </div>
@@ -459,7 +463,7 @@ function renderDeviceList() {
     const rx = d.rx_mbps != null ? d.rx_mbps.toFixed(2) : '—';
     const tx = d.tx_mbps != null ? d.tx_mbps.toFixed(2) : '—';
     const lat = (d.latency && d.latency < 999) ? d.latency.toFixed(0)+'мс' : '—';
-    const host = d.hostname && d.hostname !== d.ip ? d.hostname : (d.vendor||'—');
+    const host = d.custom_name || ((d.hostname && d.hostname !== d.ip) ? d.hostname : (d.vendor||'—'));
     return `
     <div class="device-item ${d.online?'':'offline'} ${selectedIP===d.ip?'active':''}"
          role="listitem"
@@ -518,7 +522,7 @@ async function refreshDeviceView() {
 
     // Header
     document.getElementById('dv-ip').textContent = selectedIP;
-    document.getElementById('dv-hostname').textContent = info.hostname || '';
+    document.getElementById('dv-hostname').textContent = info.custom_name || info.hostname || '';
     document.getElementById('dv-mac').textContent = info.mac ? `[${info.mac}]` : '';
     const sb = document.getElementById('dv-status');
     sb.textContent = info.online ? 'ONLINE' : 'OFFLINE';
@@ -721,6 +725,66 @@ async function startCapture(seconds=30) {
   } catch(e) {
     el.style.color = 'var(--red)';
     el.textContent = 'Ошибка tcpdump';
+  }
+}
+
+async function startIperf(seconds=10) {
+  if(!selectedIP) return;
+  const el = document.getElementById('iperf-status');
+  el.style.display = 'block';
+  el.style.color = 'var(--orange)';
+  el.textContent = `iperf3 ${seconds}s...`;
+  try {
+    const r = await fetch(`/api/iperf/start/${selectedIP}?seconds=${seconds}`, { method:'POST' });
+    const d = await r.json();
+    if(!r.ok) {
+      el.style.color = 'var(--red)';
+      el.textContent = d.error || 'Ошибка iperf3';
+      return;
+    }
+    const poll = async () => {
+      const s = await fetch(`/api/iperf/status/${d.job_id}`);
+      const j = await s.json();
+      if(j.status === 'running') {
+        setTimeout(poll, 1500);
+        return;
+      }
+      if(j.status === 'done' && j.result) {
+        el.style.color = 'var(--green)';
+        el.textContent = `TX ${j.result.sender_mbps} / RX ${j.result.receiver_mbps} Mbps`;
+      } else {
+        el.style.color = 'var(--red)';
+        el.textContent = `iperf3: ${j.error || 'ошибка'}`;
+      }
+    };
+    poll();
+  } catch(e) {
+    el.style.color = 'var(--red)';
+    el.textContent = 'Ошибка iperf3';
+  }
+}
+
+async function setDeviceName() {
+  if(!selectedIP) return;
+  const cur = allDevices.find(d => d.ip === selectedIP);
+  const currentName = (cur && cur.custom_name) ? cur.custom_name : '';
+  const name = prompt('Пользовательское имя устройства (пусто = сброс):', currentName);
+  if(name === null) return;
+  try {
+    const r = await fetch(`/api/device-name/${selectedIP}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: name.trim() })
+    });
+    const d = await r.json();
+    if(!r.ok) {
+      alert(d.error || 'Не удалось сохранить имя');
+      return;
+    }
+    await refreshDevices();
+    await refreshDeviceView();
+  } catch(e) {
+    alert('Ошибка сохранения имени');
   }
 }
 
