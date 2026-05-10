@@ -24,7 +24,8 @@ Python 3.10+
 ```bash
 sudo apt update
 sudo apt install -y python3 python3-pip python3-venv \
-    iputils-ping nmap arp-scan tcpdump iperf3 avahi-utils libpcap-dev
+    iputils-ping nmap arp-scan tcpdump iperf3 traceroute iputils-tracepath \
+    avahi-utils libpcap-dev
 ```
 
 `arp-scan` и `nmap` используются для обнаружения устройств.  
@@ -93,6 +94,7 @@ LOG_DIR=/opt/netanalyzer/logs        # где хранить логи событ
 CAPTURE_DIR=/opt/netanalyzer/captures # где хранить pcap-файлы
 DEVICE_NAMES_FILE=/opt/netanalyzer/device-names.json # пользовательские имена
 IPERF_MAX_SECONDS=60   # максимум длительности iperf3-теста
+TRACEROUTE_TIMEOUT=120 # секунд на выполнение traceroute
 ```
 
 Пример:
@@ -173,8 +175,9 @@ server {
 | `POST /api/capture/start/<ip>?seconds=30` | Старт tcpdump по IP         |
 | `GET /api/capture/status/<job_id>` | Статус захвата                       |
 | `GET /api/capture/download/<job_id>` | Скачать pcap                   |
-| `POST /api/iperf/start/<ip>?seconds=10` | Старт iperf3-теста до устройства |
-| `GET /api/iperf/status/<job_id>` | Статус/результат iperf3              |
+| `POST /api/iperf/start/<ip>?seconds=10&port=5201&reverse=0` | Старт iperf3 (порт, reverse -R) |
+| `GET /api/iperf/status/<job_id>` | Статус/результат iperf3 (`error` — краткий текст) |
+| `GET /api/traceroute/<ip>?max_hops=30` | Traceroute (Linux) / tracert (Windows) |
 | `GET/POST /api/device-name/<ip>` | Получить/сохранить пользовательское имя |
 
 ---

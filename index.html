@@ -245,7 +245,7 @@ body::after {
       <button class="scan-btn" id="scan-btn" onclick="triggerScan()">↺ Скан</button>
     </div>
     <div class="sidebar-filter">
-      <input class="filter-input" type="text" placeholder="Фильтр по IP / hostname..." oninput="filterDevices(this.value)" aria-label="Фильтр устройств">
+      <input class="filter-input" type="text" placeholder="Фильтр: IP / имя / метка..." oninput="filterDevices(this.value)" aria-label="Фильтр устройств">
     </div>
     <div class="device-list" id="device-list" role="list">
       <div class="no-devices">Сканирование сети...<br>Подождите 10–30 сек</div>
@@ -278,7 +278,19 @@ body::after {
         <button class="section-ping-btn" onclick="setDeviceName()">✎ Имя</button>
         <button class="section-ping-btn" onclick="startIperf(10)">⇆ iPerf 10s</button>
         <button class="section-ping-btn" onclick="startCapture(30)">🧪 Tcpdump 30s</button>
+        <button class="section-ping-btn" onclick="runTraceroute()">↯ Trace</button>
         <button class="section-ping-btn" onclick="manualPing()">⚡ Ping</button>
+      </div>
+
+      <div class="iperf-toolbar" style="padding: 8px 16px; border-bottom: 1px solid var(--border); display:flex; gap:12px; align-items:center; flex-wrap:wrap; background:var(--bg1);">
+        <span style="font-size:10px;color:var(--c2);text-transform:uppercase;letter-spacing:1px;">iperf3</span>
+        <label style="font-size:10px;color:var(--c2);display:flex;align-items:center;gap:6px;">Порт
+          <input id="iperf-port" type="number" min="1" max="65535" value="5201" aria-label="Порт iperf3"
+            style="width:68px;background:var(--bg2);border:1px solid var(--border);color:var(--c0);font-family:var(--font-mono);font-size:11px;padding:4px 6px;border-radius:2px;">
+        </label>
+        <label style="font-size:10px;color:var(--c2);display:flex;align-items:center;gap:6px;cursor:pointer;">
+          <input type="checkbox" id="iperf-reverse" style="accent-color:var(--teal);"> Reverse (-R)
+        </label>
       </div>
 
       <!-- Metrics strip -->
@@ -335,6 +347,11 @@ body::after {
           </thead>
           <tbody id="traffic-tbody"></tbody>
         </table>
+      </div>
+
+      <div class="traffic-area" id="trace-panel" style="display:none;padding-top:12px;">
+        <div style="font-size:10px;text-transform:uppercase;letter-spacing:1.5px;color:var(--c2);padding-bottom:6px;border-bottom:1px solid var(--border);">Traceroute / tracert</div>
+        <pre id="trace-output" style="margin-top:8px;background:var(--bg2);border:1px solid var(--border);padding:10px;font-size:11px;color:var(--c1);white-space:pre-wrap;max-height:240px;overflow:auto;line-height:1.45;"></pre>
       </div>
 
       <!-- Events -->
@@ -424,6 +441,23 @@ function fmt_bytes(b) {
   return b+' Б';
 }
 
+function iperfErrorMessage(j) {
+  if(j.error_human) return j.error_human;
+  const e = j.error;
+  if(typeof e === 'string' && e.trim()) {
+    const t = e.trim();
+    if(t.startsWith('{')) {
+      try {
+        const o = JSON.parse(t);
+        if(o && o.error) return String(o.error).length > 240 ? String(o.error).slice(0,237)+'…' : String(o.error);
+      } catch(_) {}
+      return 'Ошибка iperf3: нет соединения с сервером или неверный порт. Запустите на цели «iperf3 -s».';
+    }
+    return t.length > 280 ? t.slice(0,277)+'…' : t;
+  }
+  return 'Ошибка iperf3: проверьте, что на цели запущен сервер (iperf3 -s) и открыт порт.';
+}
+
 function setVal(id, val, unit='') {
   const el = document.getElementById(id);
   if(el) el.textContent = (val===null||val===undefined||val<0) ? '—' : val;
@@ -451,7 +485,9 @@ function renderDeviceList() {
   const filt = filterText.toLowerCase();
 
   const filtered = allDevices.filter(d =>
-    !filt || d.ip.includes(filt) || (d.hostname||'').toLowerCase().includes(filt)
+    !filt || d.ip.includes(filt)
+    || (d.hostname||'').toLowerCase().includes(filt)
+    || (d.custom_name||'').toLowerCase().includes(filt)
   );
 
   if(!filtered.length) {
@@ -731,15 +767,19 @@ async function startCapture(seconds=30) {
 async function startIperf(seconds=10) {
   if(!selectedIP) return;
   const el = document.getElementById('iperf-status');
+  const portEl = document.getElementById('iperf-port');
+  const revEl = document.getElementById('iperf-reverse');
+  const port = portEl ? Math.max(1, Math.min(65535, parseInt(portEl.value,10) || 5201)) : 5201;
+  const reverse = revEl && revEl.checked ? '1' : '0';
   el.style.display = 'block';
   el.style.color = 'var(--orange)';
-  el.textContent = `iperf3 ${seconds}s...`;
+  el.textContent = `iperf3 ${seconds}s, порт ${port}...`;
   try {
-    const r = await fetch(`/api/iperf/start/${selectedIP}?seconds=${seconds}`, { method:'POST' });
+    const r = await fetch(`/api/iperf/start/${selectedIP}?seconds=${seconds}&port=${port}&reverse=${reverse}`, { method:'POST' });
     const d = await r.json();
     if(!r.ok) {
       el.style.color = 'var(--red)';
-      el.textContent = d.error || 'Ошибка iperf3';
+      el.textContent = d.error_human || d.error || 'Ошибка запуска iperf3';
       return;
     }
     const poll = async () => {
@@ -751,16 +791,41 @@ async function startIperf(seconds=10) {
       }
       if(j.status === 'done' && j.result) {
         el.style.color = 'var(--green)';
-        el.textContent = `TX ${j.result.sender_mbps} / RX ${j.result.receiver_mbps} Mbps`;
+        el.textContent = `TX ${j.result.sender_mbps} / RX ${j.result.receiver_mbps} Mbps (порт ${j.port||port})`;
       } else {
         el.style.color = 'var(--red)';
-        el.textContent = `iperf3: ${j.error || 'ошибка'}`;
+        el.textContent = `iperf3: ${iperfErrorMessage(j)}`;
       }
     };
     poll();
   } catch(e) {
     el.style.color = 'var(--red)';
-    el.textContent = 'Ошибка iperf3';
+    el.textContent = 'Ошибка iperf3 (сеть или сервер недоступен)';
+  }
+}
+
+async function runTraceroute() {
+  if(!selectedIP) return;
+  const panel = document.getElementById('trace-panel');
+  const pre = document.getElementById('trace-output');
+  panel.style.display = 'block';
+  pre.textContent = 'Выполняется traceroute…';
+  try {
+    const r = await fetch(`/api/traceroute/${selectedIP}?max_hops=30`);
+    const d = await r.json();
+    if(!r.ok) {
+      pre.textContent = d.error_human || d.error || 'Не удалось выполнить traceroute';
+      return;
+    }
+    if(d.lines && d.lines.length) {
+      pre.textContent = d.lines.join('\n');
+    } else if(d.text) {
+      pre.textContent = d.text;
+    } else {
+      pre.textContent = '(пустой вывод)';
+    }
+  } catch(e) {
+    pre.textContent = 'Ошибка запроса traceroute';
   }
 }
 

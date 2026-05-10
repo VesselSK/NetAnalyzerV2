@@ -5,7 +5,7 @@ NetAnalyzer v2 — Пассивный захват трафика + обнару
 Запуск:     sudo python3 app.py   (нужен root для scapy/promiscuous mode)
 """
 
-import subprocess, threading, time, json, re, os, socket, statistics, ipaddress, uuid
+import subprocess, threading, time, json, re, os, socket, statistics, ipaddress, uuid, platform
 from pathlib import Path
 from datetime import datetime
 from collections import deque, defaultdict
@@ -44,6 +44,7 @@ CAPTURE_DIR = Path(os.environ.get("CAPTURE_DIR", "./captures")).resolve()
 CAPTURE_MAX_SECONDS = int(os.environ.get("CAPTURE_MAX_SECONDS", "300"))
 DEVICE_NAMES_FILE = Path(os.environ.get("DEVICE_NAMES_FILE", "./device-names.json")).resolve()
 IPERF_MAX_SECONDS = int(os.environ.get("IPERF_MAX_SECONDS", "60"))
+TRACEROUTE_TIMEOUT = int(os.environ.get("TRACEROUTE_TIMEOUT", "120"))
 
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
@@ -692,6 +693,127 @@ def api_ping(ip: str):
     return jsonify({"ip": ip, "latency": lat, "jitter": jit, "packet_loss": loss})
 
 
+def _extract_iperf_json_error(text: str) -> str | None:
+    if not text or not text.strip():
+        return None
+    s = text.strip()
+    if s.startswith("{"):
+        try:
+            obj = json.loads(s)
+            if isinstance(obj, dict) and obj.get("error"):
+                return str(obj["error"])
+        except json.JSONDecodeError:
+            pass
+    for line in s.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                obj = json.loads(line)
+                if isinstance(obj, dict) and obj.get("error"):
+                    return str(obj["error"])
+            except json.JSONDecodeError:
+                continue
+    return None
+
+
+def _humanize_iperf_error(stderr: str, stdout: str) -> str:
+    raw = (stderr or "").strip() or (stdout or "").strip()
+    msg = _extract_iperf_json_error(stdout) or _extract_iperf_json_error(raw) or raw
+    if not msg:
+        return "Не удалось выполнить тест iperf3."
+    low = msg.lower()
+    if "connection refused" in low or "unable to connect" in low:
+        return (
+            "Нет соединения с iperf3-сервером (connection refused). "
+            "На целевом хосте запустите «iperf3 -s», проверьте порт и файрвол."
+        )
+    if "no route" in low or "network is unreachable" in low:
+        return "Сеть недоступна или нет маршрута до хоста."
+    if "timed out" in low or "timeout" in low:
+        return "Таймаут: хост не отвечает или порт закрыт."
+    if "name or service not known" in low or "cannot resolve" in low:
+        return "Не удалось разрешить имя хоста."
+    if len(msg) > 280:
+        return msg[:277] + "..."
+    return msg
+
+
+def _run_traceroute(ip: str, max_hops: int) -> tuple[list[str], str, str]:
+    """Возвращает (строки вывода, использованная команда, ошибка для человека)."""
+    max_hops = max(1, min(64, max_hops))
+    sysname = platform.system()
+    if sysname == "Windows":
+        cmd = ["tracert", "-d", "-h", str(max_hops), ip]
+        try:
+            r = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=TRACEROUTE_TIMEOUT,
+                errors="replace",
+                creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
+            )
+        except FileNotFoundError:
+            return [], " ".join(cmd), "Команда tracert не найдена."
+        out = (r.stdout or "") + (("\n" + r.stderr) if r.stderr else "")
+        lines = out.splitlines()
+        return lines, " ".join(cmd), ""
+
+    for exe, args in (
+        ("traceroute", ["-n", "-w", "2", "-q", "1", "-m", str(max_hops), ip]),
+        ("tracepath", ["-n", "-m", str(max_hops), ip]),
+    ):
+        cmd_list = [exe, *args]
+        try:
+            r = subprocess.run(
+                cmd_list,
+                capture_output=True,
+                text=True,
+                timeout=TRACEROUTE_TIMEOUT,
+                errors="replace",
+            )
+            out = (r.stdout or "") + (("\n" + r.stderr) if r.stderr else "")
+            lines = out.splitlines()
+            return lines, " ".join(cmd_list), ""
+        except FileNotFoundError:
+            continue
+        except subprocess.TimeoutExpired:
+            return [], " ".join(cmd_list), "Traceroute превысил время ожидания."
+
+    return [], "", (
+        "Не найдены команды traceroute/tracepath. Установите: "
+        "sudo apt install traceroute iputils-tracepath"
+    )
+
+
+@app.route("/api/traceroute/<ip>")
+def api_traceroute(ip: str):
+    """Traceroute (Linux: traceroute/tracepath; Windows: tracert)."""
+    try:
+        ipaddress.ip_address(ip)
+    except ValueError:
+        return jsonify({"error": "invalid ip", "error_human": "Некорректный IP-адрес."}), 400
+
+    max_hops = max(1, min(64, int(request.args.get("max_hops", "30"))))
+    lines, cmd_used, human_err = _run_traceroute(ip, max_hops)
+    if human_err and not lines:
+        return jsonify({
+            "ip": ip,
+            "lines": [],
+            "command": cmd_used,
+            "error": human_err,
+            "error_human": human_err,
+        }), 503
+
+    return jsonify({
+        "ip": ip,
+        "max_hops": max_hops,
+        "command": cmd_used,
+        "lines": lines,
+        "text": "\n".join(lines),
+    })
+
+
 @app.route("/api/info")
 def api_info():
     iface = detect_iface()
@@ -803,12 +925,15 @@ def api_capture_download(job_id: str):
     return send_file(p, as_attachment=True, download_name=p.name)
 
 
-def _iperf_worker(job_id: str, ip: str, seconds: int, reverse: bool):
-    cmd = ["iperf3", "-c", ip, "-J", "-t", str(seconds), "-P", "1"]
+def _iperf_worker(job_id: str, ip: str, seconds: int, reverse: bool, port: int):
+    cmd = ["iperf3", "-c", ip, "-p", str(port), "-J", "-t", str(seconds), "-P", "1"]
     if reverse:
         cmd.append("-R")
     try:
-        add_event(f"IPERF старт: {ip}, {seconds}s{' (reverse)' if reverse else ''}", "info")
+        add_event(
+            f"IPERF старт: {ip}:{port}, {seconds}s{' (reverse)' if reverse else ''}",
+            "info",
+        )
         r = subprocess.run(
             cmd, capture_output=True, text=True, timeout=seconds + 25
         )
@@ -817,12 +942,34 @@ def _iperf_worker(job_id: str, ip: str, seconds: int, reverse: bool):
             job["finished_at"] = time.time()
             if r.returncode != 0:
                 job["status"] = "error"
-                job["error"] = (r.stderr or r.stdout or "iperf3 failed").strip()[:500]
+                human = _humanize_iperf_error(r.stderr, r.stdout)
+                job["error"] = human
+                job["error_human"] = human
+                job["port"] = port
                 iperf_jobs[job_id] = job
-                add_event(f"IPERF ошибка: {job['error']}", "error")
+                add_event(f"IPERF ошибка: {human}", "error")
                 return
 
-            payload = json.loads(r.stdout or "{}")
+            try:
+                payload = json.loads(r.stdout or "{}")
+            except json.JSONDecodeError:
+                job["status"] = "error"
+                human = _humanize_iperf_error(r.stderr, r.stdout)
+                job["error"] = human
+                job["error_human"] = human
+                iperf_jobs[job_id] = job
+                add_event(f"IPERF ошибка (ответ не JSON): {human}", "error")
+                return
+
+            if payload.get("error"):
+                human = _humanize_iperf_error("", json.dumps(payload))
+                job["status"] = "error"
+                job["error"] = human
+                job["error_human"] = human
+                iperf_jobs[job_id] = job
+                add_event(f"IPERF ошибка: {human}", "error")
+                return
+
             end = payload.get("end", {})
             sender = end.get("sum_sent", {}) or {}
             receiver = end.get("sum_received", {}) or {}
@@ -834,16 +981,21 @@ def _iperf_worker(job_id: str, ip: str, seconds: int, reverse: bool):
 
             job["status"] = "done"
             job["result"] = result
+            job["port"] = port
             iperf_jobs[job_id] = job
             add_event(
-                f"IPERF готов: {ip} TX={result['sender_mbps']} Mbps RX={result['receiver_mbps']} Mbps",
+                f"IPERF готов: {ip}:{port} TX={result['sender_mbps']} Mbps RX={result['receiver_mbps']} Mbps",
                 "info",
             )
     except Exception as e:
         with lock:
             job = iperf_jobs.get(job_id, {})
             job["status"] = "error"
-            job["error"] = str(e)
+            human = str(e)
+            if len(human) > 280:
+                human = human[:277] + "..."
+            job["error"] = human
+            job["error_human"] = human
             job["finished_at"] = time.time()
             iperf_jobs[job_id] = job
         add_event(f"IPERF exception: {e}", "error")
@@ -858,6 +1010,10 @@ def api_iperf_start(ip: str):
 
     seconds = max(3, min(IPERF_MAX_SECONDS, int(request.args.get("seconds", "10"))))
     reverse = request.args.get("reverse", "0") in ("1", "true", "yes")
+    port = int(request.args.get("port", "5201"))
+    if port < 1 or port > 65535:
+        return jsonify({"error": "invalid port", "error_human": "Порт должен быть от 1 до 65535."}), 400
+
     job_id = uuid.uuid4().hex[:12]
 
     with lock:
@@ -867,13 +1023,20 @@ def api_iperf_start(ip: str):
             "ip": ip,
             "seconds": seconds,
             "reverse": reverse,
+            "port": port,
             "started_at": time.time(),
         }
 
     threading.Thread(
-        target=_iperf_worker, args=(job_id, ip, seconds, reverse), daemon=True
+        target=_iperf_worker, args=(job_id, ip, seconds, reverse, port), daemon=True
     ).start()
-    return jsonify({"job_id": job_id, "status": "running", "seconds": seconds, "reverse": reverse})
+    return jsonify({
+        "job_id": job_id,
+        "status": "running",
+        "seconds": seconds,
+        "reverse": reverse,
+        "port": port,
+    })
 
 
 @app.route("/api/iperf/status/<job_id>")
