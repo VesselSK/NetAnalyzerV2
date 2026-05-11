@@ -311,45 +311,58 @@ def arp_scan(network: str, iface: str):
     return found
 
 
+def discovery_pass(iface: str, my_ip: str, network: str):
+    """Один проход сканирования сети и обновления состояния устройств."""
+    now = time.time()
+    found = arp_scan(network, iface)
+    if not found:
+        add_event(
+            f"Сканирование не вернуло хосты (iface={iface}, network={network})",
+            "warn"
+        )
+
+    with lock:
+        for ip, info in found.items():
+            if ip not in devices:
+                add_event(f"Новое устройство: {ip} [{info.get('vendor','')}]", "info")
+            devices[ip] = {
+                **info,
+                "is_self": ip == my_ip,
+                "custom_name": get_custom_name(ip, info.get("mac", "")),
+                "online": True,
+                "last_seen": ts(),
+                "last_seen_ts": now,
+                "rx_mbps":  traffic[ip]["rx_mbps"],
+                "tx_mbps":  traffic[ip]["tx_mbps"],
+                "pps":      traffic[ip]["pps"],
+            }
+
+        # Считаем offline по TTL, чтобы не держать "вечный online".
+        online_ttl = SCAN_INTERVAL * 2.5
+        for ip in list(devices.keys()):
+            age = now - float(devices[ip].get("last_seen_ts", 0))
+            devices[ip]["online"] = age <= online_ttl
+
+    return found
+
+
 def discovery_loop():
     """Периодически сканирует сеть."""
-    iface   = detect_iface()
-    my_ip   = get_my_ip(iface)
-    network = get_network_prefix(iface)
-
-    add_event(f"Интерфейс: {iface} ({my_ip})", "info")
-    add_event(f"Сканирую сеть {network}...", "info")
+    last_iface = None
+    last_network = None
 
     while True:
-        now = time.time()
-        found = arp_scan(network, iface)
-        if not found:
-            add_event(
-                f"Сканирование не вернуло хосты (iface={iface}, network={network})",
-                "warn"
-            )
+        iface = detect_iface()
+        my_ip = get_my_ip(iface)
+        network = get_network_prefix(iface)
 
-        with lock:
-            for ip, info in found.items():
-                if ip not in devices:
-                    add_event(f"Новое устройство: {ip} [{info.get('vendor','')}]", "info")
-                devices[ip] = {
-                    **info,
-                    "is_self": ip == my_ip,
-                    "custom_name": get_custom_name(ip, info.get("mac", "")),
-                    "online": True,
-                    "last_seen": ts(),
-                    "last_seen_ts": now,
-                    "rx_mbps":  traffic[ip]["rx_mbps"],
-                    "tx_mbps":  traffic[ip]["tx_mbps"],
-                    "pps":      traffic[ip]["pps"],
-                }
+        if iface != last_iface or network != last_network:
+            add_event(f"Интерфейс: {iface} ({my_ip})", "info")
+            add_event(f"Сканирую сеть {network}...", "info")
+            last_iface = iface
+            last_network = network
 
-            # Считаем offline по TTL, чтобы не держать "вечный online".
-            online_ttl = SCAN_INTERVAL * 2.5
-            for ip in list(devices.keys()):
-                age = now - float(devices[ip].get("last_seen_ts", 0))
-                devices[ip]["online"] = age <= online_ttl
+        discovery_pass(iface, my_ip, network)
 
         time.sleep(SCAN_INTERVAL)
 
@@ -550,6 +563,22 @@ def server_metrics_loop():
 @app.route("/")
 def index():
     return render_template("index.html")
+
+
+@app.route("/api/scan", methods=["POST"])
+def api_scan():
+    """Принудительный запуск сканирования сети."""
+    iface = detect_iface()
+    my_ip = get_my_ip(iface)
+    network = get_network_prefix(iface)
+    add_event(f"Ручной скан: iface={iface}, network={network}", "info")
+    found = discovery_pass(iface, my_ip, network)
+    return jsonify({
+        "ok": True,
+        "iface": iface,
+        "network": network,
+        "found": len(found),
+    })
 
 
 @app.route("/api/devices")

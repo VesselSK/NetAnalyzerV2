@@ -717,13 +717,19 @@ async function manualPing() {
 // ══════════════════════════════════════════════════════
 // SCAN TRIGGER
 // ══════════════════════════════════════════════════════
-function triggerScan() {
+async function triggerScan() {
   const btn = document.getElementById('scan-btn');
   btn.classList.add('scanning');
   btn.textContent = '↺ ...';
-  refreshDevices().finally(() => {
-    setTimeout(()=>{ btn.classList.remove('scanning'); btn.textContent='↺ Скан'; }, 2000);
-  });
+  try {
+    await fetch('/api/scan', { method: 'POST' });
+    await refreshDevices();
+    if (selectedIP) await refreshDeviceView();
+  } catch(e) {
+    console.error('triggerScan:', e);
+  } finally {
+    setTimeout(()=>{ btn.classList.remove('scanning'); btn.textContent='↺ Скан'; }, 1200);
+  }
 }
 
 async function startCapture(seconds=30) {
