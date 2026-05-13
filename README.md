@@ -110,7 +110,8 @@ sudo IFACE=eth0 venv/bin/python3 app.py
 # /etc/systemd/system/netanalyzer.service
 [Unit]
 Description=NetAnalyzer v2
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
